@@ -1,0 +1,26 @@
+[package]
+name = "stm32f407_play"
+version = "0.1.0"
+authors = ["Justace Clutter <justacec@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+panic-abort = "0.3"
+panic-semihosting = "0.5"
+panic-itm = "0.4"
+cortex-m-semihosting = "0.3"
+cortex-m = "0.6"
+cortex-m-rt = "0.6"
+cortex-m-rtfm = "0.5"
+rtfm-core = "0.3"
+embedded-hal = "0.2.3"
+stm32f4xx-hal = {version = "0.7", features = ["stm32f407", "rt"]}
+stm32f4 = "0.10"
+num-derive = {version = "0.3", default-features = false }
+num-traits = {version = "0.2", default-features = false }
+num = {version = "0.2", default-features = false }
+heapless = "0.5"
+bbqueue = "0.4"
+byte = "0.2"
