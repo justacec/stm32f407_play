@@ -392,6 +392,14 @@ const APP: () = {
                 return
             },
             Some(request) => {
+                // Check to make sure that we are not in the middle of a command reception
+                let rx_ndtr = cx.resources.dma.st[3].ndtr.read().bits() as u32;
+                loop {
+                    if rx_ndtr == 32 {
+                        break;
+                    }
+                }
+
                 // Set the memory locaiton here of the buffer for the DMA
                 let grant_address: u32 = request.deref().as_ptr() as u32;
                 unsafe {
@@ -430,7 +438,7 @@ const APP: () = {
     // Rx of Command and Processing Section
     // -------------------------------------------
 
-    #[task(spawn = [transmit_command_results], resources = [tx_queue_producer, rx_queue_consumer, itm, tx_queue_write_grant, process_requests_state])]
+    #[task(spawn = [transmit_command_results], capacity = 4, resources = [tx_queue_producer, rx_queue_consumer, itm, tx_queue_write_grant, process_requests_state])]
     fn process_command(cx: process_command::Context) {
         // Check to see if we are already running...
         if *cx.resources.process_requests_state == true {
@@ -512,7 +520,7 @@ const APP: () = {
 
     // This function is called when the SPI master stops talking to the slave and sets the NSS line high
     // This function will then call the process command function
-    #[task(binds=EXTI15_10, spawn=[process_command], resources = [dma, spi, spi_state, itm, rx_queue_producer, rx_queue_write_grant])]
+    #[task(binds=EXTI15_10, spawn=[process_command], resources = [dma, spi, spi_state, itm, rx_queue_producer, rx_queue_write_grant, process_requests_state])]
     fn spi_complete(cx: spi_complete::Context) {
 
         // I have lost track of what this actaully does
@@ -542,7 +550,9 @@ const APP: () = {
             *cx.resources.rx_queue_write_grant = None;
 
             // Fire off the process command task
-            cx.spawn.process_command().unwrap();
+            if *cx.resources.process_requests_state == false {
+                cx.spawn.process_command().unwrap();
+            }
         }
 
         // Get a grant
@@ -571,6 +581,7 @@ const APP: () = {
     }
 
     extern "C" {
+        fn USART1();
         fn USART2();
     }
 
