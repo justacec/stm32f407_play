@@ -394,6 +394,10 @@ const APP: () = {
             None => {
                 *cx.resources.spi_state = SPIState::WaitForCommand;
                 myprintln!(cx, "stop2 (None)");
+
+                // Call pend the spi_complete function in order to setup the rx_queue memory locations in DMA
+                cortex_m::peripheral::NVIC::pend(interrupt::EXTI15_10);
+
                 return
             },
             Some(request) => {
@@ -409,7 +413,6 @@ const APP: () = {
                     cx.resources.dma.st[4].ndtr.write(|w| w.bits(request.deref().len() as u32));
         
                     // Cler the previous event flag so the DMA can be re-enabled
-                    // [Yea, lost a lot of time here... :/]
                     cx.resources.dma.hifcr.write(|w| w.ctcif4().set_bit());
                 }
         
@@ -436,6 +439,10 @@ const APP: () = {
                 cx.resources.dma.st[4].cr.modify(|_,w| w.en().set_bit());
         
                 *cx.resources.spi_state = SPIState::SendingResponse;
+
+                // Set the busy pin to low so the master gets a low to high transition to trigger the 
+                // data pull routine
+                cx.resources.spi_busy.set_low().unwrap();
 
                 // Tell the master stuff is ready
                 cx.resources.spi_busy.set_high().unwrap();
@@ -545,6 +552,108 @@ const APP: () = {
             (*exti_pointer).pr.modify(|_,w| w.pr12().set_bit());
         }
 
+        match cx.resources.spi_state { 
+            SPIState::WaitForCommand => { myprintln!(cx, "A1"); },
+            SPIState::SendingResponse => { myprintln!(cx, "A2");} 
+        }
+
+        match *cx.resources.spi_state {
+            SPIState::SendingResponse => {
+                // Lets make sure all of the inteded data has been read from the TX DMA
+                // This is because the master does a 4-byte read to see how much
+                // data to pull from the slave.  This callback gets kicked off right after
+                // that initial 4-byte read, this block makes sure we do not move out of the
+                // state too early.
+                let n_bytes_left = cx.resources.dma.st[4].ndtr.read().bits() as u32;
+                myprintln!(cx, "N_bytes_left: {}", n_bytes_left);
+                if n_bytes_left > 0 {
+                    return;
+                }
+
+                // Stop both of the DMA channels
+    //            cx.resources.dma.st[3].cr.modify(|_,w| w.en().clear_bit());
+                cx.resources.dma.st[4].cr.modify(|_,w| w.en().clear_bit());
+
+                // Free up the memory in the tx queue
+                cx.resources.tx_queue_read_grant.take().unwrap().release();
+
+                // Set the state back to the wait for command
+//                *cx.resources.spi_state = SPIState::WaitForCommand;
+
+                // Set the SPI DR to 0 to clear out the tx buffer
+                unsafe {
+                    cx.resources.spi.dr.write(|w| w.bits(0));
+                }
+
+                // Spawn the transmit_results again
+                // If there are no more results to send, it will set the flags accordingly
+                cx.spawn.transmit_command_results().unwrap();
+
+            },
+            SPIState::WaitForCommand => {
+                // Stop both of the DMA channels
+                cx.resources.dma.st[3].cr.modify(|_,w| w.en().clear_bit());
+                cx.resources.dma.st[4].cr.modify(|_,w| w.en().clear_bit());
+
+                if cx.resources.rx_queue_write_grant.is_some() {
+                    // Get the size of the data that was read in
+                    let n_bytes = 32 - cx.resources.dma.st[3].ndtr.read().bits() as u32;
+        
+                    // Take the grant
+                    let grant = cx.resources.rx_queue_write_grant.take().unwrap();
+
+                    // Set the rx_prod_grant to None
+                    // Maybe this line is not needed because of the `take()` in the above line?
+                    *cx.resources.rx_queue_write_grant = None;
+
+                    // Commit the grant
+    //                cx.resources.rx_queue_write_grant.take().unwrap().commit(n_bytes as usize);
+                    // Commit the grant
+                    if n_bytes > 0 {
+                        grant.commit(n_bytes as usize);
+    
+                        // Fire off the process command task
+                        if *cx.resources.process_requests_state == false {
+                            cx.spawn.process_command().unwrap();
+                        }
+                    }   
+                }
+        
+                // Get a grant
+                *cx.resources.rx_queue_write_grant = Some(cx.resources.rx_queue_producer.grant(32).unwrap());
+        
+                // Set the memory address of the DMA
+                let grant_address: u32 = cx.resources.rx_queue_write_grant.as_ref().unwrap().deref().as_ptr() as u32;
+                unsafe {
+                    cx.resources.dma.st[3].m0ar.write(|w| w.bits(grant_address));
+                }
+        
+                // Ensure the rx dma is enabled here
+                unsafe {
+                    // Cler the previous event flag so the DMA can be re-enabled
+                    // [Yea, lost a lot of time here... :/]
+                    cx.resources.dma.lifcr.write(|w| w.ctcif3().set_bit());
+        
+                    // Reset the counter to the max message size
+                    cx.resources.dma.st[3].ndtr.write(|w| w.bits(32));
+                }
+        
+                // Read the DR on the SPI to ensure that the OVR flag is cleared
+                cx.resources.spi.dr.read();
+        
+                // Enable the read DMA
+                cx.resources.dma.st[3].cr.modify(|_,w| w.en().set_bit());
+
+                // Disable the transmit DMA
+                cx.resources.dma.st[4].cr.modify(|_,w| w.en().clear_bit());
+
+                // Tell the master that the data return is completed and we are now ready to receive new commands
+                cx.resources.spi_busy.set_low().unwrap();
+
+            }
+        }
+
+/*
         if *cx.resources.spi_state == SPIState::SendingResponse {
             // Lets make sure all of the inteded data has been read from the TX DMA
             // This is because the master does a 4-byte read to see how much
@@ -575,9 +684,9 @@ const APP: () = {
             // Spawn the transmit_results again
             // If there are no more results to send, it will set the flags accordingly
             cx.spawn.transmit_command_results().unwrap();
-
         }
-
+*/
+/*
         // I could have had this in a match block but then these would have executed mutually exclusive.
         // I needed to handle the case where it came into this function as sending response, but
         // still needed to reset the state to a full read.  To minimize code duplication, I took the 
@@ -591,17 +700,24 @@ const APP: () = {
                 // Get the size of the data that was read in
                 let n_bytes = 32 - cx.resources.dma.st[3].ndtr.read().bits() as u32;
     
-                // Commit the grant
-                cx.resources.rx_queue_write_grant.take().unwrap().commit(n_bytes as usize);
-    
+                // Take the grant
+                let grant = cx.resources.rx_queue_write_grant.take().unwrap();
+
                 // Set the rx_prod_grant to None
                 // Maybe this line is not needed because of the `take()` in the above line?
                 *cx.resources.rx_queue_write_grant = None;
-    
-                // Fire off the process command task
-                if *cx.resources.process_requests_state == false {
-                    cx.spawn.process_command().unwrap();
-                }
+
+                // Commit the grant
+//                cx.resources.rx_queue_write_grant.take().unwrap().commit(n_bytes as usize);
+                // Commit the grant
+                if n_bytes > 0 {
+                    grant.commit(n_bytes as usize);
+ 
+                    // Fire off the process command task
+                    if *cx.resources.process_requests_state == false {
+                        cx.spawn.process_command().unwrap();
+                    }
+                }   
             }
     
             // Get a grant
@@ -630,7 +746,7 @@ const APP: () = {
             cx.resources.dma.st[3].cr.modify(|_,w| w.en().set_bit());
 
             // Disable the transmit DMA
-//            cx.resources.dma.st[4].cr.modify(|_,w| w.en().clear_bit());
+            cx.resources.dma.st[4].cr.modify(|_,w| w.en().clear_bit());
 
             // Tell the master that the data return is completed and we are now ready to receive new commands
             cx.resources.spi_busy.set_low().unwrap();
@@ -640,7 +756,9 @@ const APP: () = {
 //                cx.spawn.process_command().unwrap();
 //            }
         }
+*/
     }
+
 
     extern "C" {
         fn USART1();
